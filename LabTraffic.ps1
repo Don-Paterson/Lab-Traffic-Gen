@@ -411,8 +411,13 @@ function Invoke-StartClient {
             if ($openload) {
                 # -l gives a time limit; without it a run only stops on Enter,
                 # which a minimised window can never receive.
+                #
+                # No spaces in the User-Agent: Start-Process joins ArgumentList
+                # with spaces and adds no quoting, so a browser-style string
+                # arrives as several arguments and openload exits 1. This also
+                # makes the generated traffic easy to filter in SmartConsole.
                 $httpArgs = @('-l', "$Duration",
-                              '-h', 'User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                              '-h', 'User-Agent', 'LabTraffic/1.0',
                               "http://$HttpTarget/", "$($settings.HttpClients)")
                 $entry = Start-Tracked -Label "HTTP load ($($settings.HttpClients) clients)" `
                                        -FilePath $openload -ArgumentList $httpArgs
