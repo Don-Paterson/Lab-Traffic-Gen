@@ -24,6 +24,7 @@
 
 .PARAMETER Load
     Light, Medium (default) or Heavy. See $Profiles below for the values.
+    Rates are totals across all streams, roughly 15 / 70 / 250 Mb/s.
     Named -Load rather than -Profile because $Profile is a PowerShell
     automatic variable and shadowing it inside a script is asking for trouble.
 
@@ -39,7 +40,9 @@
     loads cross eth0 -> eth2.
 
 .PARAMETER Duration
-    Seconds to run before stopping on its own. Default 3600.
+    Seconds to run before stopping on its own. Default 900 (15 minutes).
+    Pass -Duration 3600 for a soak test; a short default means a forgotten
+    run costs the shared lab host far less.
 
 .PARAMETER NoHttp
     Client only. Skip the OpenWebLoad HTTP load.
@@ -72,7 +75,12 @@
       Client -> Server     TCP 3389  (only when -WithPsping is used)
 
     At Medium the HTTP load alone produces roughly 78 logs/sec if Track is left
-    on, so set it to None or the log server will fill. See the README.
+    on, so set it to None or the log server will fill.
+
+    Data volumes per hour, if you leave a run going: Light ~7 GB, Medium
+    ~32 GB, Heavy ~113 GB. Nothing is written to disk - iperf3 and openload
+    both discard what they receive - but it all crosses the hypervisor.
+    See the README.
 #>
 
 [CmdletBinding()]
@@ -90,7 +98,7 @@ param(
 
     [string]$HttpTarget = '192.168.12.101',
 
-    [int]$Duration = 3600,
+    [int]$Duration = 900,
 
     [switch]$NoHttp,
 
@@ -112,10 +120,15 @@ $UdpPort  = 5202
 $HttpPort = 80
 $ConnPort = 3389      # RDP: a Windows kernel listener, keeps up with PsPing
 
+# Rates are TOTALS, not per stream: Invoke-StartClient divides TcpRate across
+# Streams before passing -b to iperf3. Kept deliberately modest, because the
+# point is to make the gateway look busy, not to saturate a shared lab host.
+# Packet rate does that far more cheaply than bit rate, hence the 256-byte
+# UDP datagrams.
 $Profiles = @{
-    Light  = @{ TcpRate = '50M';  Streams = 2; UdpRate = '20M';  UdpLen = 256; HttpClients = 2;  ConnPerSec = 5  }
-    Medium = @{ TcpRate = '300M'; Streams = 4; UdpRate = '100M'; UdpLen = 256; HttpClients = 5;  ConnPerSec = 20 }
-    Heavy  = @{ TcpRate = '800M'; Streams = 8; UdpRate = '300M'; UdpLen = 256; HttpClients = 15; ConnPerSec = 40 }
+    Light  = @{ TcpRate = '10M';  Streams = 2; UdpRate = '5M';  UdpLen = 256; HttpClients = 2;  ConnPerSec = 5  }
+    Medium = @{ TcpRate = '50M';  Streams = 4; UdpRate = '20M'; UdpLen = 256; HttpClients = 5;  ConnPerSec = 20 }
+    Heavy  = @{ TcpRate = '200M'; Streams = 8; UdpRate = '50M'; UdpLen = 256; HttpClients = 15; ConnPerSec = 40 }
 }
 
 # If these downloads fail (no internet in the lab), drop the exe into the bin
@@ -384,9 +397,12 @@ function Invoke-StartClient {
 
     $tracked = @()
 
-    $tcpArgs = @('-c', $Target, '-p', "$TcpPort", '-b', $settings.TcpRate,
+    # iperf3 applies -b to EACH parallel stream, so divide the profile's total
+    # across them. Without this, -b 50M -P 4 sends 200 Mb/s, not 50.
+    $perStream = [math]::Round(($settings.TcpRate -replace 'M$', '') / $settings.Streams, 1)
+    $tcpArgs = @('-c', $Target, '-p', "$TcpPort", '-b', "${perStream}M",
                  '-P', "$($settings.Streams)", '-t', "$Duration", '-i', '0')
-    $entry = Start-Tracked -Label "TCP load ($($settings.TcpRate) x$($settings.Streams))" `
+    $entry = Start-Tracked -Label "TCP load ($($settings.TcpRate) total, $($settings.Streams) streams)" `
                            -FilePath $iperf -ArgumentList $tcpArgs
     if ($entry) { $tracked += $entry }
 

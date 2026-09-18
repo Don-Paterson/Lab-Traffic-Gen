@@ -28,20 +28,36 @@ generate connections the gateway never classifies, because no payload is sent.
 
 ### Load profiles
 
-| Profile | TCP rate | Streams | UDP rate | HTTP clients | PsPing connects/sec |
+Rates are **totals**, not per stream. iperf3 applies `-b` to each parallel
+stream, so the script divides the profile rate across them before calling it.
+
+| Profile | TCP total | Streams | UDP total | HTTP clients | PsPing connects/sec |
 |---|---|---|---|---|---|
-| Light | 50 Mb/s | 2 | 20 Mb/s | 2 | 5 |
-| Medium (default) | 300 Mb/s | 4 | 100 Mb/s | 5 | 20 |
-| Heavy | 800 Mb/s | 8 | 300 Mb/s | 15 | 40 |
+| Light | 10 Mb/s | 2 | 5 Mb/s | 2 | 5 |
+| Medium (default) | 50 Mb/s | 4 | 20 Mb/s | 5 | 20 |
+| Heavy | 200 Mb/s | 8 | 50 Mb/s | 15 | 40 |
 
 Five HTTP clients against the CCTE lab's A-DMZ web server gives roughly 78
 transactions/sec.
 
-Start with Medium. Heavy is worth trying only when you have the lab to
-yourself, since Skillable hosts are shared and the Windows VMs usually run out
-of CPU before the gateway does.
+### What that costs
 
----
+The rates are deliberately modest. On shared infrastructure such as Skillable,
+every bit crosses the hypervisor, so a heavy run is antisocial even though
+nothing is written to disk (iperf3 and openload both discard what they
+receive).
+
+| Profile | Total rate | UDP packets/sec | Per hour |
+|---|---|---|---|
+| Light | ~15 Mb/s | ~2,400 | ~7 GB |
+| Medium | ~70 Mb/s | ~9,700 | ~32 GB |
+| Heavy | ~250 Mb/s | ~24,000 | ~113 GB |
+
+Packet rate, not bit rate, is what loads the SND cores, which is why the UDP
+load uses 256-byte datagrams. Medium produces a clearly visible SND and
+worker load in `cpview` while moving relatively little data.
+
+The default duration is **15 minutes**. Pass `-Duration 3600` for a soak test.
 
 ## Quick start
 
@@ -61,7 +77,7 @@ listeners (5201 and 5202). Leave it running.
 
 ```powershell
 irm https://raw.githubusercontent.com/Don-Paterson/Lab-Traffic-Gen/main/LabTraffic.ps1 -OutFile C:\LabTraffic.ps1
-C:\LabTraffic.ps1 -Role Client -Action Start -Load Medium -Target 192.168.11.201
+C:\LabTraffic.ps1 -Role Client -Action Start -Load Light -Target 192.168.11.201
 ```
 
 ### 3. Check and stop
@@ -132,7 +148,7 @@ output more realistic, but nothing here has been tested over a VPN.
 | `-Load` | Client | `Medium` | `Light`, `Medium`, `Heavy`. |
 | `-Target` | Client | `192.168.11.201` | Host running the server role (iperf3 loads). |
 | `-HttpTarget` | Client | `192.168.12.101` | Web server for the HTTP load. A-DMZ by default, so HTTP crosses eth3 while iperf3 crosses eth2. |
-| `-Duration` | both | `3600` | Seconds. iperf3 and the PsPing loop stop on their own. |
+| `-Duration` | both | `900` | Seconds. All loads stop on their own. Pass `3600` for a soak test. |
 | `-NoUdp` | Client | off | Skip the UDP packet-rate load. |
 | `-NoHttp` | Client | off | Skip the OpenWebLoad HTTP load. |
 | `-WithPsping` | Client | off | Also run the PsPing connect-only loop. |
@@ -196,7 +212,8 @@ limit throughput first.
 | Load still running after `Stop` | `Get-Process iperf3, psping64 \| Stop-Process`, then delete `C:\LabTraffic\state.json`. |
 | `No web server on <ip>:80` | Check the web server on A-DMZ is running, and that the http rule is installed. |
 | HTTP load skipped, openload unavailable | Copy `openload.exe` into `C:\LabTraffic\bin`. |
-| Lab host becomes sluggish | Drop to `-Load Light` and add `-NoHttp`. |
+| Lab host becomes sluggish | Drop to `-Load Light`, add `-NoHttp`, and shorten `-Duration`. |
+| Throughput higher than the profile says | You are on a pre-fix version where `-b` was passed per stream. Pull the current script. |
 
 ## Related
 
