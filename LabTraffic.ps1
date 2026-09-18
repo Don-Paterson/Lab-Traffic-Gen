@@ -8,10 +8,12 @@
     (A-GUI). It starts iperf3 and PsPing in the background, tracks what it
     started in a state file, and can report on or stop exactly those processes.
 
-    Three loads can run at once, each optional:
+    Four loads can run at once, each optional:
       TCP throughput   - steady multi-stream TCP, spreads across both SND cores
       UDP packet rate  - small datagrams, high packets/sec, stresses the SNDs
-      Connection rate  - repeated TCP connects, stresses the firewall workers
+      HTTP requests    - OpenWebLoad, short-lived HTTP connections with real
+                         payload, so App Control and URL Filtering classify it
+      Connection rate  - PsPing connect-only loop, opt-in via -WithPsping
 
 .PARAMETER Role
     Server on the receiving host, Client on the sending host. Required for
@@ -26,16 +28,26 @@
     automatic variable and shadowing it inside a script is asking for trouble.
 
 .PARAMETER Target
-    Client only. IP of the machine running -Role Server.
+    Client only. IP of the machine running -Role Server (iperf3 loads).
       192.168.11.201  A-Host  (gateway eth0 -> eth2)
       192.168.12.101  A-DMZ   (gateway eth0 -> eth3)
       192.168.21.201  B-Host  (across the site-to-site VPN; untested)
 
+.PARAMETER HttpTarget
+    Client only. Web server for the OpenWebLoad HTTP load. Defaults to A-DMZ
+    (192.168.12.101), so the HTTP load crosses eth0 -> eth3 while the iperf3
+    loads cross eth0 -> eth2.
+
 .PARAMETER Duration
     Seconds to run before stopping on its own. Default 3600.
 
-.PARAMETER NoConnectionRate
-    Client only. Skip the PsPing connection-rate loop.
+.PARAMETER NoHttp
+    Client only. Skip the OpenWebLoad HTTP load.
+
+.PARAMETER WithPsping
+    Client only. Also run the PsPing connect-only loop. Off by default: the
+    HTTP load generates connection rate with real payload, which PsPing cannot.
+    Useful when you want handshakes with no data, or for latency measurement.
 
 .PARAMETER NoUdp
     Client only. Skip the UDP packet-rate load.
@@ -52,9 +64,15 @@
 
 .NOTES
     Lab use only. This generates a handful of long-lived flows plus repeated
-    identical connections, which is far more uniform than production traffic.
-    Requires a Check Point rule allowing Client -> Server on TCP/UDP 5201-5202
-    and TCP 3389. See the README.
+    short-lived HTTP connections, which is more uniform than production traffic.
+
+    Check Point rules needed, both with Track set to None:
+      Client -> Server     TCP/UDP 5201-5202
+      Client -> HttpTarget TCP 80
+      Client -> Server     TCP 3389  (only when -WithPsping is used)
+
+    At Medium the HTTP load alone produces roughly 78 logs/sec if Track is left
+    on, so set it to None or the log server will fill. See the README.
 #>
 
 [CmdletBinding()]
@@ -70,9 +88,13 @@ param(
 
     [string]$Target = '192.168.11.201',
 
+    [string]$HttpTarget = '192.168.12.101',
+
     [int]$Duration = 3600,
 
-    [switch]$NoConnectionRate,
+    [switch]$NoHttp,
+
+    [switch]$WithPsping,
 
     [switch]$NoUdp,
 
@@ -87,16 +109,17 @@ $ErrorActionPreference = 'Stop'
 
 $TcpPort  = 5201
 $UdpPort  = 5202
+$HttpPort = 80
 $ConnPort = 3389      # RDP: a Windows kernel listener, keeps up with PsPing
 
 $Profiles = @{
-    Light  = @{ TcpRate = '50M';  Streams = 2; UdpRate = '20M';  UdpLen = 256; ConnPerSec = 5  }
-    Medium = @{ TcpRate = '300M'; Streams = 4; UdpRate = '100M'; UdpLen = 256; ConnPerSec = 20 }
-    Heavy  = @{ TcpRate = '800M'; Streams = 8; UdpRate = '300M'; UdpLen = 256; ConnPerSec = 40 }
+    Light  = @{ TcpRate = '50M';  Streams = 2; UdpRate = '20M';  UdpLen = 256; HttpClients = 2;  ConnPerSec = 5  }
+    Medium = @{ TcpRate = '300M'; Streams = 4; UdpRate = '100M'; UdpLen = 256; HttpClients = 5;  ConnPerSec = 20 }
+    Heavy  = @{ TcpRate = '800M'; Streams = 8; UdpRate = '300M'; UdpLen = 256; HttpClients = 15; ConnPerSec = 40 }
 }
 
-# If these downloads fail (no internet in the lab), drop iperf3.exe and
-# psping.exe into the bin folder by hand and the script will use them.
+# If these downloads fail (no internet in the lab), drop the exe into the bin
+# folder by hand and the script will use it.
 #
 # iperf3 asset names carry the version (iperf-<ver>-win64.zip), so there is no
 # static "latest" URL. Resolve-IperfUrl asks the GitHub API for the current
@@ -104,6 +127,10 @@ $Profiles = @{
 $IperfVersion = '3.21'
 $IperfUrl     = "https://github.com/ar51an/iperf3-win-builds/releases/download/$IperfVersion/iperf-$IperfVersion-win64.zip"
 $PspingUrl    = 'https://live.sysinternals.com/psping64.exe'
+
+# OpenWebLoad 0.1.2 (2001) lives on SourceForge behind an interstitial page, so
+# there is no direct download URL. The binary is vendored in this repo instead.
+$OpenloadUrl  = 'https://raw.githubusercontent.com/Don-Paterson/Lab-Traffic-Gen/main/bin/openload.exe'
 
 $BinPath   = Join-Path $InstallPath 'bin'
 $StatePath = Join-Path $InstallPath 'state.json'
@@ -371,7 +398,30 @@ function Invoke-StartClient {
         if ($entry) { $tracked += $entry }
     }
 
-    if (-not $NoConnectionRate) {
+    if (-not $NoHttp) {
+        $httpUp = Test-NetConnection -ComputerName $HttpTarget -Port $HttpPort -WarningAction SilentlyContinue
+        if (-not $httpUp.TcpTestSucceeded) {
+            Write-Warn "No web server on $HttpTarget`:$HttpPort - skipping the HTTP load"
+        }
+        else {
+            $openload = $null
+            try { $openload = Get-Tool -Name 'openload.exe' -Url $OpenloadUrl }
+            catch { Write-Warn "openload.exe unavailable - skipping the HTTP load. $($_.Exception.Message)" }
+
+            if ($openload) {
+                # -l gives a time limit; without it a run only stops on Enter,
+                # which a minimised window can never receive.
+                $httpArgs = @('-l', "$Duration",
+                              '-h', 'User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                              "http://$HttpTarget/", "$($settings.HttpClients)")
+                $entry = Start-Tracked -Label "HTTP load ($($settings.HttpClients) clients)" `
+                                       -FilePath $openload -ArgumentList $httpArgs
+                if ($entry) { $tracked += $entry }
+            }
+        }
+    }
+
+    if ($WithPsping) {
         $psping = Get-Tool -Name 'psping.exe' -Url $PspingUrl
         Write-ConnRateScript
         $interval = [math]::Round(1 / $settings.ConnPerSec, 3)
@@ -379,7 +429,7 @@ function Invoke-StartClient {
                       '-File', "`"$LoopPath`"",
                       '-Psping', "`"$psping`"", '-Target', $Target, '-Port', "$ConnPort",
                       '-Interval', "$interval", '-Duration', "$Duration")
-        $entry = Start-Tracked -Label "Connection rate (~$($settings.ConnPerSec)/sec)" `
+        $entry = Start-Tracked -Label "PsPing connects (~$($settings.ConnPerSec)/sec)" `
                                -FilePath 'powershell.exe' -ArgumentList $loopArgs
         if ($entry) { $tracked += $entry }
     }
@@ -390,6 +440,7 @@ function Invoke-StartClient {
         Role      = 'Client'
         Load      = $Load
         Target    = $Target
+        HttpTarget = $(if ($NoHttp) { $null } else { $HttpTarget })
         Duration  = $Duration
         StartedAt = (Get-Date).ToString('o')
         Processes = $tracked
@@ -448,6 +499,7 @@ function Invoke-Status {
     if ($state.Role -eq 'Client') {
         Write-Host "Load      : $($state.Load)"
         Write-Host "Target    : $($state.Target)"
+        if ($state.HttpTarget) { Write-Host "HTTP      : $($state.HttpTarget)" }
         $left = $state.Duration - $uptime.TotalSeconds
         if ($left -gt 0) { Write-Host ("Remaining : {0:N0} min" -f ($left / 60)) }
         else { Write-Host 'Remaining : expired' }
@@ -485,7 +537,7 @@ function Invoke-Install {
 
     $taskName = "LabTraffic-$Role"
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptCopy`" -Role $Role -Action Start"
-    if ($Role -eq 'Client') { $arguments += " -Load $Load -Target $Target -Duration $Duration" }
+    if ($Role -eq 'Client') { $arguments += " -Load $Load -Target $Target -HttpTarget $HttpTarget -Duration $Duration" }
 
     $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
     $trigger   = New-ScheduledTaskTrigger -AtLogOn
