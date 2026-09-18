@@ -97,8 +97,13 @@ $Profiles = @{
 
 # If these downloads fail (no internet in the lab), drop iperf3.exe and
 # psping.exe into the bin folder by hand and the script will use them.
-$IperfUrl  = 'https://github.com/ar51an/iperf3-win-builds/releases/latest/download/iperf3.zip'
-$PspingUrl = 'https://live.sysinternals.com/psping64.exe'
+#
+# iperf3 asset names carry the version (iperf-<ver>-win64.zip), so there is no
+# static "latest" URL. Resolve-IperfUrl asks the GitHub API for the current
+# release; $IperfUrl below is the offline/API-failure fallback.
+$IperfVersion = '3.21'
+$IperfUrl     = "https://github.com/ar51an/iperf3-win-builds/releases/download/$IperfVersion/iperf-$IperfVersion-win64.zip"
+$PspingUrl    = 'https://live.sysinternals.com/psping64.exe'
 
 $BinPath   = Join-Path $InstallPath 'bin'
 $StatePath = Join-Path $InstallPath 'state.json'
@@ -124,14 +129,44 @@ function Initialize-Folders {
     }
 }
 
+function Resolve-IperfUrl {
+    <#
+      Finds the download URL for the current iperf3 Windows build.
+      Passed to Get-Tool as a scriptblock so it only runs when the exe is
+      actually missing. Falls back to the pinned $IperfUrl on any failure.
+    #>
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/ar51an/iperf3-win-builds/releases/latest' `
+                                     -Headers @{ 'User-Agent' = 'Lab-Traffic-Gen' } -UseBasicParsing
+        # Plain win64 build: skip the -static-auth, -dynamic-auth and win7 variants
+        $asset = $release.assets |
+                 Where-Object { $_.name -match '^iperf-[\d.]+-win64\.zip$' } |
+                 Select-Object -First 1
+        if ($asset) {
+            Write-Step "Using iperf3 $($release.tag_name)"
+            return $asset.browser_download_url
+        }
+        Write-Warn "No win64 asset in the latest release, falling back to $IperfVersion"
+    }
+    catch {
+        Write-Warn "GitHub API lookup failed, falling back to $IperfVersion"
+    }
+    return $IperfUrl
+}
+
 function Get-Tool {
     <#
       Returns the full path to a tool, fetching it if missing.
       Looks in bin, then beside the script, then downloads.
+
+      -Url takes either a string or a scriptblock. A scriptblock is only
+      invoked if the download is actually needed, which keeps the GitHub API
+      lookup out of the way when the tool is already present.
     #>
     param(
         [Parameter(Mandatory)][string]$Name,      # iperf3.exe / psping.exe
-        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][object]$Url,
         [switch]$IsZip
     )
 
@@ -144,6 +179,9 @@ function Get-Tool {
         Write-Ok "$Name copied from script folder"
         return $dest
     }
+
+    # Resolve a deferred URL now that we know we need it.
+    if ($Url -is [scriptblock]) { $Url = & $Url }
 
     Write-Step "Downloading $Name ..."
     try {
@@ -279,7 +317,7 @@ function Set-LocalFirewall {
 
 function Invoke-StartServer {
     Initialize-Folders
-    $iperf = Get-Tool -Name 'iperf3.exe' -Url $IperfUrl -IsZip
+    $iperf = Get-Tool -Name 'iperf3.exe' -Url { Resolve-IperfUrl } -IsZip
     Set-LocalFirewall
 
     $tracked = @()
@@ -307,7 +345,7 @@ function Invoke-StartServer {
 function Invoke-StartClient {
     Initialize-Folders
     $settings = $Profiles[$Load]
-    $iperf = Get-Tool -Name 'iperf3.exe' -Url $IperfUrl -IsZip
+    $iperf = Get-Tool -Name 'iperf3.exe' -Url { Resolve-IperfUrl } -IsZip
 
     Write-Step "Checking $Target`:$TcpPort ..."
     $reach = Test-NetConnection -ComputerName $Target -Port $TcpPort -WarningAction SilentlyContinue
@@ -457,7 +495,7 @@ function Invoke-Install {
                            -Principal $principal -Force | Out-Null
 
     Write-Ok "Scheduled task '$taskName' registered (runs at logon)."
-    Write-Warn 'Remove it with: Unregister-ScheduledTask -TaskName ' + $taskName
+    Write-Warn "Remove it with: Unregister-ScheduledTask -TaskName $taskName"
 }
 
 # ---------------------------------------------------------------------------
